@@ -25,30 +25,55 @@ use futures::Poll;
 
 thread_local!(static STARTER: RefCell<bool> = RefCell::new(false));
 
-pub struct Task<'a, R> {
-    inner: TaskInner<'a, R>,
+lazy_static! {
+    static ref POOL: Arc<MsQueue<Box<CallTrait>>> = {
+        let queue = Arc::new(MsQueue::<Box<CallTrait>>::new());
+
+        for _ in 0 .. num_cpus::get() {
+            let queue = queue.clone();
+            thread::spawn(move || {
+                loop {
+                    let f = queue.pop();
+                    f.call();
+                }
+            });
+        }
+
+        queue
+    };
 }
 
-enum TaskInner<'a, R> {
+pub struct Task<'a, R> {
+    inner: TaskInner<R>, 
+    marker: PhantomData<&'a ()>
+}
+
+enum TaskInner<R> {
     Invalid,
-    NotStarted(Box<CallTrait<R> + 'a>),
+    NotStarted(Box<CallTrait>, Oneshot<R>),
     StartedOrFinished(Oneshot<R>),
 }
 
-trait CallTrait<R>: Send { fn call(self: Box<Self>) -> R; }
-impl<T, R> CallTrait<R> for T where T: FnOnce() -> R + Send, R: Send {
-    #[inline] fn call(self: Box<Self>) -> R { self() }
+trait CallTrait: Send { fn call(self: Box<Self>); }
+impl<T> CallTrait for T where T: FnOnce() + Send {
+    #[inline] fn call(self: Box<Self>) { self() }
 }
 
-impl<'a, R> Task<'a, R> where R: Send {
+impl<'a, R> Task<'a, R> where R: Send + 'a {
     pub fn new<F>(f: F) -> Task<'a, R> where F: FnOnce() -> R + Send + 'a {
+        let (tx, rx) = futures::oneshot();
+
+        let f = Box::new(move || tx.complete(f())) as Box<CallTrait + 'a>;
+        let f: Box<CallTrait + 'static> = unsafe { mem::transmute(f) };
+    
         Task {
-            inner: TaskInner::NotStarted(Box::new(f))
+            inner: TaskInner::NotStarted(f, rx),
+            marker: PhantomData,
         }
     }
 }
 
-impl<'a, R> Future for Task<'a, R> where R: Send + 'static {
+impl<'a, R> Future for Task<'a, R> where R: Send + 'a {
     type Item = R;
     type Error = ();
 
@@ -56,14 +81,10 @@ impl<'a, R> Future for Task<'a, R> where R: Send + 'static {
         match mem::replace(&mut self.inner, TaskInner::Invalid) {
             TaskInner::Invalid => panic!(),
 
-            TaskInner::NotStarted(task) => {
+            TaskInner::NotStarted(task, mut rx) => {
                 STARTER.with(|s| { assert!(*s.borrow()); });
 
-                let (tx, mut rx) = futures::oneshot();
-                let task: Box<CallTrait<R> + 'static> = unsafe { mem::transmute(task) }; 
-                thread::spawn(move || {
-                    tx.complete(task.call());
-                });
+                POOL.push(task);
 
                 let result = rx.poll().map_err(|_| ());
                 self.inner = TaskInner::StartedOrFinished(rx);
